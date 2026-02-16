@@ -1,0 +1,48 @@
+{
+  "name": "@vii7/whatsapp",
+  "version": "1.0.1",
+  "description": "Building a bot on the baileys library in an easy way ",
+  "license": "MIT",
+
+  "main": "dist/index.cjs",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "dev": "nodemon --exec ts-node src/index.ts",
+    "build": "tsup src/index.ts --format esm,cjs --dts --clean",
+    "watch": "tsup src/index.ts --format esm,cjs --dts --watch",
+    "start": "node dist/index.cjs"
+  },
+
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "express": "^5.2.1",
+    "pino": "^10.3.0",
+    "qrcode-terminal": "^0.12.0",
+    "zod": "^4.3.6"
+  },
+
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.0.10",
+    "nodemon": "^3.1.11",
+    "ts-node": "^10.9.2",
+    "tsup": "^8.5.1",
+    "typescript": "^4.9.5"
+  }
+}
