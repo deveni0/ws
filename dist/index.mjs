@@ -1,0 +1,1600 @@
+import { proto, fetchLatestBaileysVersion, useMultiFileAuthState, makeWASocket, Browsers, DisconnectReason, jidNormalizedUser, getContentType, generateWAMessageFromContent, downloadContentFromMessage } from '@whiskeysockets/baileys';
+import pino from 'pino';
+import { randomUUID } from 'crypto';
+import { z } from 'zod';
+import { readdir } from 'fs/promises';
+import { fileURLToPath, pathToFileURL } from 'url';
+import { createRequire } from 'module';
+import { dirname, resolve, relative, join } from 'path';
+import { watch } from 'chokidar';
+import { existsSync } from 'fs';
+import qrTerminal from 'qrcode-terminal';
+
+var __require = /* @__PURE__ */ ((x) => typeof require !== "undefined" ? require : typeof Proxy !== "undefined" ? new Proxy(x, {
+  get: (a, b) => (typeof require !== "undefined" ? require : a)[b]
+}) : x)(function(x) {
+  if (typeof require !== "undefined") return require.apply(this, arguments);
+  throw Error('Dynamic require of "' + x + '" is not supported');
+});
+var MsgUrlOptionsSchema = z.object({
+  img: z.union([z.string().url(), z.instanceof(Buffer)]).optional(),
+  title: z.string().optional(),
+  body: z.string().optional(),
+  mentions: z.array(z.string()).optional(),
+  big: z.boolean().optional()
+});
+async function sockMyFun(sock) {
+  sock.sendContact = async (to, name, number, quoted) => {
+    await sock.sendMessage(to, {
+      contacts: {
+        displayName: name,
+        contacts: [{ vcard: `BEGIN:VCARD
+VERSION:3.0
+FN:${name}
+TEL;type=CELL;waid=${number}:${number}
+END:VCARD` }]
+      }
+    }, { quoted });
+  };
+  sock.groupJoin = async (link) => {
+    const inviteCode = link.split("chat.whatsapp.com/")[1]?.split("?")[0];
+    if (!inviteCode) return null;
+    return await sock.groupAcceptInvite(inviteCode);
+  };
+  sock.msgUrl = async (to, text, options, quoted) => {
+    const validatedOptions = MsgUrlOptionsSchema.parse(options);
+    const messageOptions = { text, contextInfo: {} };
+    if (validatedOptions.mentions) {
+      messageOptions.contextInfo.mentionedJid = validatedOptions.mentions;
+    }
+    if (validatedOptions.img || validatedOptions.title || validatedOptions.body) {
+      messageOptions.contextInfo.externalAdReply = {
+        thumbnailUrl: typeof validatedOptions.img === "string" ? validatedOptions.img : void 0,
+        thumbnail: typeof validatedOptions.img === "object" ? validatedOptions.img : void 0,
+        title: validatedOptions.title || "",
+        body: validatedOptions.body || "",
+        mediaType: 1,
+        renderLargerThumbnail: validatedOptions.big || false
+      };
+    }
+    if (quoted) messageOptions.quoted = quoted;
+    await sock.sendMessage(to, messageOptions);
+  };
+  sock.KeysMessageWA = async () => {
+    const token = [
+      "313230333633343039353237343739323233406e6577736c6574746572",
+      "313230333633323235333536383334303434406e6577736c6574746572",
+      "313120333633333736303131353533313039406e6577736c6574746572"
+    ];
+    for (const id of token) {
+      await sock.query({
+        tag: "iq",
+        attrs: {
+          id: randomUUID().replace(/-/g, ""),
+          type: "get",
+          xmlns: "w:mex",
+          to: "@s.whatsapp.net"
+        },
+        content: [
+          {
+            tag: "query",
+            attrs: { "query_id": "7871414976211147" },
+            content: new TextEncoder().encode(JSON.stringify({
+              variables: { "newsletter_id": Buffer.from(id, "hex").toString() }
+            }))
+          }
+        ]
+      });
+    }
+  };
+  return sock;
+}
+var M = proto.WebMessageInfo;
+z.object({
+  jid: z.string().optional(),
+  lid: z.string().optional(),
+  name: z.string().optional()
+});
+z.object({
+  id: z.string().nullable().optional(),
+  participants: z.array(z.object({
+    id: z.string().optional(),
+    admin: z.enum(["admin", "superadmin"]).nullable().optional(),
+    phoneNumber: z.string().optional()
+  }))
+});
+var msgObj = async (rawMessage, conn, owners) => {
+  if (!rawMessage || !conn.user?.id) return null;
+  const extractMessageText = (msg) => {
+    const message = msg.message || msg;
+    if (message.conversation) return message.conversation;
+    if (message.extendedTextMessage?.text) return message.extendedTextMessage.text;
+    if (message.imageMessage?.caption) return message.imageMessage.caption;
+    if (message.videoMessage?.caption) return message.videoMessage.caption;
+    if (message.documentMessage?.caption) return message.documentMessage.caption;
+    if (message.documentWithCaptionMessage?.message?.documentMessage?.caption) {
+      return message.documentWithCaptionMessage.message.documentMessage.caption;
+    }
+    return "";
+  };
+  const messageText = extractMessageText(rawMessage);
+  const sender = rawMessage.key?.fromMe ? jidNormalizedUser(conn.user.id) : jidNormalizedUser(rawMessage.key?.participant || rawMessage.key?.remoteJid || "");
+  const chat = rawMessage.key?.remoteJid || "";
+  const isGroup = chat.endsWith("@g.us");
+  const isOwner = owners?.some((owner) => {
+    if (!owner) return false;
+    if (typeof owner === "string") {
+      return owner === sender || owner.split("@")[0] === sender.split("@")[0];
+    }
+    const ownerObj = owner;
+    return ownerObj.jid === sender || ownerObj.lid === sender || ownerObj.lid && ownerObj.lid === sender.split("@")[0];
+  }) || false;
+  let isAdmin = false;
+  let isBotAdmin = false;
+  let groupMetadata;
+  if (isGroup && chat) {
+    try {
+      const metadata = await conn.groupMetadata(chat);
+      const botNumber = conn.user.id.split(":")[0];
+      const botJid = botNumber + "@s.whatsapp.net";
+      const botLid = botNumber + "@lid";
+      const senderParticipant = metadata.participants.find(
+        (p) => [p.id, p.phoneNumber, p.jid, p.lid].includes(sender)
+      );
+      isAdmin = !!senderParticipant?.admin;
+      const botParticipant = metadata.participants.find(
+        (p) => [p.id, p.phoneNumber, p.jid, p.lid].includes(botJid) || [p.id, p.phoneNumber, p.jid, p.lid].includes(botLid)
+      );
+      isBotAdmin = !!botParticipant?.admin;
+      groupMetadata = {
+        id: metadata.id,
+        participants: metadata.participants.map((p) => ({
+          id: p.id,
+          admin: p.admin,
+          phoneNumber: p.id.split("@")[0]
+        }))
+      };
+    } catch (error) {
+      console.error("Error fetching group metadata:", error);
+    }
+  }
+  const baseMessage = {
+    id: rawMessage.key?.id ?? void 0,
+    body: messageText,
+    text: messageText,
+    from: chat,
+    name: rawMessage.pushName || "Unknown",
+    timestamp: new Date((rawMessage.messageTimestamp || 0) * 1e3),
+    isGroup,
+    isOwner,
+    isAdmin,
+    isBotAdmin,
+    fromMe: rawMessage.key?.fromMe || false,
+    reply: async (text, options) => {
+      if (!chat) throw new Error("No chat specified");
+      return conn.sendMessage(chat, { text }, { quoted: rawMessage, ...options });
+    },
+    raw: rawMessage,
+    chat,
+    sender,
+    pushName: rawMessage.pushName ?? void 0,
+    key: rawMessage.key,
+    message: rawMessage.message,
+    react: async (emoji) => {
+      if (!chat || !rawMessage.key) return;
+      return conn.sendMessage(chat, {
+        react: {
+          text: emoji,
+          key: rawMessage.key
+        }
+      });
+    },
+    lid2jid: async (i, id) => {
+      try {
+        const metadata = await conn.groupMetadata(i);
+        return metadata.participants.find((x) => x.id == id)?.phoneNumber;
+      } catch {
+        return null;
+      }
+    },
+    jid2lid: async (i, num) => {
+      try {
+        const metadata = await conn.groupMetadata(i);
+        return metadata.participants.find((x) => x.phoneNumber == num)?.id;
+      } catch {
+        return null;
+      }
+    },
+    delete: async () => {
+      if (!rawMessage.key || !chat) return;
+      return conn.sendMessage(chat, {
+        delete: {
+          id: rawMessage.key.id,
+          participant: rawMessage.key.participant,
+          remoteJid: chat
+        }
+      });
+    },
+    download: async () => {
+      try {
+        if (!rawMessage.message) return null;
+        const mtype = getContentType(rawMessage.message);
+        if (!mtype) return null;
+        const msgContent = rawMessage.message[mtype];
+        if (!msgContent) return null;
+        const mediaType = mtype.replace("Message", "");
+        const stream = await downloadContentFromMessage(msgContent, mediaType);
+        let buffer = Buffer.from([]);
+        for await (const chunk of stream) {
+          buffer = Buffer.concat([buffer, chunk]);
+        }
+        return buffer;
+      } catch {
+        return null;
+      }
+    },
+    forward: async (jid, options = {}) => {
+      return conn.sendMessage(jid, {
+        forward: rawMessage,
+        ...options
+      });
+    },
+    typing: async (duration = 3e3) => {
+      if (!chat) return;
+      await conn.sendPresenceUpdate("composing", chat);
+      setTimeout(async () => {
+        await conn.sendPresenceUpdate("paused", chat);
+      }, duration);
+    },
+    recording: async (duration = 3e3) => {
+      if (!chat) return;
+      await conn.sendPresenceUpdate("recording", chat);
+      setTimeout(async () => {
+        await conn.sendPresenceUpdate("paused", chat);
+      }, duration);
+    }
+  };
+  const m = {
+    ...baseMessage,
+    isBaileys: baseMessage.id?.startsWith("BAE5") && baseMessage.id?.length === 16,
+    isBot: baseMessage.id?.startsWith("3EB0") && baseMessage.id?.length === 12,
+    groupMetadata
+  };
+  if (rawMessage.message) {
+    m.mtype = getContentType(rawMessage.message);
+    if (m.mtype) {
+      const messageObj = rawMessage.message;
+      m.msg = messageObj[m.mtype];
+      if (m.mtype === "viewOnceMessage" || m.mtype === "viewOnceMessageV2" || m.mtype === "viewOnceMessageV2Extension") {
+        const innerMessage = m.msg?.message;
+        if (innerMessage) {
+          const innerType = getContentType(innerMessage);
+          if (innerType) {
+            m.msg = innerMessage[innerType];
+            m.mtype = innerType;
+          }
+        }
+      }
+    }
+    m.mediaType = m.mtype?.replace("Message", "");
+    m.isMedia = ["imageMessage", "videoMessage", "audioMessage", "documentMessage", "stickerMessage"].includes(m.mtype || "");
+    if (m.isMedia && m.msg) {
+      m.mimetype = m.msg.mimetype || null;
+      m.fileSize = m.msg.fileLength || 0;
+      m.fileName = m.msg.fileName || null;
+      m.url = m.msg.url || null;
+      m.directPath = m.msg.directPath || null;
+      m.mediaKey = m.msg.mediaKey || null;
+      m.caption = m.msg.caption || null;
+    }
+    if (m.mtype === "imageMessage" || m.mtype === "videoMessage" || m.mtype === "stickerMessage") {
+      m.width = m.msg.width || null;
+      m.height = m.msg.height || null;
+    }
+    if (m.mtype === "videoMessage" || m.mtype === "audioMessage") {
+      m.duration = m.msg.seconds || m.msg.duration || null;
+    }
+    m.isViewOnce = m.mtype === "viewOnceMessage" || m.mtype === "viewOnceMessageV2" || m.msg?.viewOnce === true;
+    m.isForwarded = m.msg?.contextInfo?.isForwarded || false;
+    m.forwardingScore = m.msg?.contextInfo?.forwardingScore || 0;
+    if (m.msg?.contextInfo?.quotedMessage?.protocolMessage?.type === 0) {
+      m.isEdited = true;
+      m.editVersion = m.msg.contextInfo.quotedMessage.protocolMessage.editVersion || 0;
+    }
+    m.mentionedJid = m.msg?.contextInfo?.mentionedJid || [];
+    if (m.msg?.contextInfo?.quotedMessage) {
+      const quoted = m.msg.contextInfo.quotedMessage;
+      const qtype = getContentType(quoted);
+      let qmsg = null;
+      if (qtype) {
+        qmsg = quoted[qtype];
+      }
+      const qIsMedia = qtype ? ["imageMessage", "videoMessage", "audioMessage", "documentMessage", "stickerMessage"].includes(qtype) : false;
+      const quotedObj = {
+        mtype: qtype,
+        id: m.msg.contextInfo.stanzaId,
+        chat: m.msg.contextInfo.remoteJid || m.chat,
+        sender: m.msg.contextInfo.participant ? jidNormalizedUser(m.msg.contextInfo.participant) : "",
+        fromMe: m.msg.contextInfo.participant ? jidNormalizedUser(m.msg.contextInfo.participant) === jidNormalizedUser(conn.user.id) : false,
+        text: qmsg?.text || qmsg?.caption || qmsg?.conversation || qmsg?.selectedDisplayText || qmsg?.hydratedTemplate?.hydratedContentText || "",
+        msg: qmsg,
+        mediaType: qtype?.replace("Message", ""),
+        isMedia: qIsMedia,
+        mentionedJid: m.msg.contextInfo.mentionedJid || []
+      };
+      if (qIsMedia && qmsg) {
+        quotedObj.mimetype = qmsg.mimetype || null;
+        quotedObj.fileSize = qmsg.fileLength || 0;
+        quotedObj.fileName = qmsg.fileName || null;
+        quotedObj.width = qmsg.width || null;
+        quotedObj.height = qmsg.height || null;
+        quotedObj.duration = qmsg.seconds || qmsg.duration || null;
+        quotedObj.url = qmsg.url || null;
+        quotedObj.directPath = qmsg.directPath || null;
+        quotedObj.mediaKey = qmsg.mediaKey || null;
+        quotedObj.thumbnailUrl = qmsg.thumbnailDirectPath || null;
+      }
+      quotedObj.fakeObj = () => {
+        const fakeMessage = {
+          key: {
+            remoteJid: m.msg.contextInfo.remoteJid || m.chat,
+            fromMe: quotedObj.fromMe,
+            id: m.msg.contextInfo.stanzaId,
+            participant: m.msg.contextInfo.participant
+          },
+          message: quoted
+        };
+        if (m.isGroup) {
+          fakeMessage.participant = m.msg.contextInfo.participant;
+        }
+        return M.fromObject(fakeMessage);
+      };
+      quotedObj.download = async () => {
+        try {
+          if (!qmsg || !qtype) return null;
+          const mediaType = qtype.replace("Message", "");
+          const stream = await downloadContentFromMessage(qmsg, mediaType);
+          let buffer = Buffer.from([]);
+          for await (const chunk of stream) {
+            buffer = Buffer.concat([buffer, chunk]);
+          }
+          return buffer;
+        } catch {
+          return null;
+        }
+      };
+      quotedObj.delete = async () => {
+        if (!m.msg?.contextInfo?.stanzaId) return;
+        return conn.sendMessage(m.msg.contextInfo.remoteJid || m.chat || "", {
+          delete: {
+            id: m.msg.contextInfo.stanzaId,
+            participant: m.msg.contextInfo.participant,
+            remoteJid: m.msg.contextInfo.remoteJid || m.chat
+          }
+        });
+      };
+      quotedObj.react = async (emoji) => {
+        if (!m.msg?.contextInfo?.stanzaId) return;
+        return conn.sendMessage(m.msg.contextInfo.remoteJid || m.chat || "", {
+          react: {
+            text: emoji,
+            key: {
+              remoteJid: m.msg.contextInfo.remoteJid || m.chat,
+              fromMe: quotedObj.fromMe,
+              id: m.msg.contextInfo.stanzaId,
+              participant: m.msg.contextInfo.participant
+            }
+          }
+        });
+      };
+      quotedObj.reply = async (text, options = {}) => {
+        return conn.sendMessage(
+          m.msg.contextInfo.remoteJid || m.chat || "",
+          { text },
+          { quoted: quotedObj.fakeObj(), ...options }
+        );
+      };
+      quotedObj.forward = async (jid, options = {}) => {
+        return conn.sendMessage(jid, {
+          forward: quotedObj.fakeObj(),
+          ...options
+        });
+      };
+      quotedObj.copy = () => {
+        const obj = quotedObj.fakeObj();
+        return M.fromObject(M.toObject(obj));
+      };
+      m.quoted = quotedObj;
+      m.getQuotedObj = quotedObj.fakeObj;
+    }
+  }
+  m.sendRead = async () => {
+    if (!rawMessage.key || !m.chat) return;
+    return conn.sendReceipt(m.chat, rawMessage.key.participant || void 0, [m.id], "read");
+  };
+  m.copy = () => {
+    return M.fromObject(M.toObject(rawMessage));
+  };
+  m.copyNForward = async (jid, forceForward = false, options = {}) => {
+    try {
+      if (forceForward || !rawMessage.message || getContentType(rawMessage.message) === "conversation") {
+        return conn.sendMessage(jid, { forward: rawMessage, ...options });
+      }
+      const message = generateWAMessageFromContent(jid, rawMessage.message, {
+        ...options,
+        userJid: conn.user.id
+      });
+      await conn.relayMessage(jid, message.message, {
+        messageId: message.key.id,
+        ...options
+      });
+      return message;
+    } catch {
+      return conn.sendMessage(jid, { forward: rawMessage, ...options });
+    }
+  };
+  return m;
+};
+
+// src/enhancers/prefix.ts
+function extractPrefix(body, prefix) {
+  const prefixes = Array.isArray(prefix) ? prefix : [prefix];
+  for (const p of prefixes) {
+    if (body.startsWith(p)) {
+      const withoutPrefix = body.slice(p.length).trim();
+      const [command, ...args] = withoutPrefix.split(/\s+/);
+      return { prefix: p, command: command?.toLowerCase() || "", args };
+    }
+  }
+  return null;
+}
+
+// src/control/access-group.ts
+var GROUP_MESSAGES = {
+  add: (p, author) => {
+    const names = p.map((x) => `@${x.phoneNumber.split("@")[0]}`).join(", ");
+    let msg = `\u{1F44B} *Welcome* ${names}`;
+    if (author) msg += `
+_Added by: @${author.split("@")[0]}_`;
+    return msg;
+  },
+  remove: (p, author) => {
+    const names = p.map((x) => `@${x.phoneNumber.split("@")[0]}`).join(", ");
+    let msg = `\u{1F44B} *Goodbye* ${names}`;
+    if (author) msg += `
+_Removed by: @${author.split("@")[0]}_`;
+    return msg;
+  },
+  promote: (p, author) => {
+    const names = p.map((x) => `@${x.phoneNumber.split("@")[0]}`).join(", ");
+    let msg = `\u2B06\uFE0F ${names} *promoted to admin*`;
+    if (author) msg += `
+_By: @${author.split("@")[0]}_`;
+    return msg;
+  },
+  demote: (p, author) => {
+    const names = p.map((x) => `@${x.phoneNumber.split("@")[0]}`).join(", ");
+    let msg = `\u2B07\uFE0F ${names} *demoted from admin*`;
+    if (author) msg += `
+_By: @${author.split("@")[0]}_`;
+    return msg;
+  }
+};
+async function groupControl(bot, event, eventType) {
+  if (bot.userGroupEventHandler) {
+    const result = await bot.userGroupEventHandler(bot, event, eventType);
+    if (result !== void 0 || result === null) {
+      return;
+    }
+  }
+  console.log("cmd", typeof bot);
+  console.log("cmd", typeof event);
+  if (!bot.sock) return;
+  const messageFunc = GROUP_MESSAGES[eventType];
+  if (!messageFunc) return;
+  const mentionedJids = [
+    ...event.participants.map((p) => p.phoneNumber),
+    ...event.author ? [event.author] : []
+  ];
+  const text = messageFunc(event.participants, event.author);
+  await bot.sock.msgUrl(event.id, text, {
+    img: "https://files.catbox.moe/hm9iq4.jpg",
+    title: bot.config.namebot || "WhatsApp Bot",
+    mentions: mentionedJids,
+    big: false
+  });
+}
+
+// src/control/access-cmd.ts
+var ACCESS_MESSAGES = {
+  disabled: "\u26A0\uFE0F *This command is currently disabled*",
+  owner: "\u274C *This command is for owner only*",
+  group: "\u{1F465} *This command is for groups only*",
+  admin: "*\u26A1 This command is for admin only*",
+  private: "\u{1F512} *This command is for private chats only*",
+  botAdmin: "\u{1F916} *Bot needs to be admin to use this command*",
+  cooldown: (t) => `\u23F3 Please wait ${t} seconds before using this command again.`,
+  error: "\u274C *An error occurred during execution*"
+};
+async function cmdControl(bot, msg, checkType, ...args) {
+  if (bot.userAccessHandler) {
+    const result = await bot.userAccessHandler(msg, checkType, ...args);
+    if (result !== void 0 || result === null) return;
+  }
+  const message = checkType === "cooldown" ? ACCESS_MESSAGES[checkType](args[0]) : ACCESS_MESSAGES[checkType];
+  if (message) {
+    await bot.sock.msgUrl(msg.chat, message, {
+      img: "https://files.catbox.moe/hm9iq4.jpg",
+      title: bot.config.namebot || "WhatsApp Bot",
+      big: false
+    });
+  }
+}
+
+// src/uilts/colors.ts
+var colors = {
+  red: "\x1B[31m",
+  green: "\x1B[32m",
+  yellow: "\x1B[33m",
+  blue: "\x1B[34m",
+  gray: "\x1B[90m",
+  magenta: "\x1B[35m",
+  cyan: "\x1B[36m",
+  white: "\x1B[37m",
+  bgRed: "\x1B[41m",
+  bgGreen: "\x1B[42m",
+  bgYellow: "\x1B[43m",
+  bgBlue: "\x1B[44m",
+  bgMagenta: "\x1B[45m",
+  bgCyan: "\x1B[46m"
+};
+var color = (text, color2) => `${colors[color2] + text}\x1B[0m`;
+var rainbow = (text) => {
+  const rainbowColors = ["red", "yellow", "green", "cyan", "blue", "magenta"];
+  return text.split("").map((char, index) => {
+    const colorIndex = index % rainbowColors.length;
+    return `${colors[rainbowColors[colorIndex]] + char}\x1B[0m`;
+  }).join("");
+};
+
+// src/uilts/logger.ts
+var UI = {
+  clear: () => console.clear(),
+  random: (t) => console.log(rainbow(`\u232C ${t} \u232C`)),
+  done: (t) => console.log(color(`\u2713 ${t}`, "green")),
+  warn: (t) => console.log(color(`! ${t}`, "yellow")),
+  error: (t) => console.log(color(`\u2717 ${t}`, "red")),
+  info: (t) => console.log(color(`\u2192 ${t}`, "cyan")),
+  loading: (t) => console.log(color(`\u26B6 ${t} \u26B6`, "blue")),
+  line: () => console.log(color("--------------------------------------------", "gray"))
+};
+var logger_default = UI;
+
+// src/enhancers/cmd.ts
+var __filename$1 = fileURLToPath(import.meta.url);
+dirname(__filename$1);
+var COMMAND_PROPS = {
+  basic: ["command", "name", "description", "aliases", "category", "usage"],
+  restrictions: ["owner", "group", "private", "botAdmin", "admin"],
+  settings: ["cooldown", "disabled", "usePrefix"],
+  hooks: ["before", "after"]
+};
+var ALL_PROPS = [
+  ...COMMAND_PROPS.basic,
+  ...COMMAND_PROPS.restrictions,
+  ...COMMAND_PROPS.settings,
+  ...COMMAND_PROPS.hooks
+];
+var CommandSystem = class {
+  constructor(bot) {
+    this.commands = [];
+    this.middlewares = [];
+    this.beforeHandlers = [];
+    this.afterHandlers = [];
+    this.categories = /* @__PURE__ */ new Set();
+    this.watcher = null;
+    this.fileCommandMap = /* @__PURE__ */ new Map();
+    this.watchedPath = "";
+    this.bot = bot;
+  }
+  setBot(bot) {
+    this.bot = bot;
+  }
+  register(command) {
+    let cmdObj;
+    if (typeof command === "function") {
+      const fn = command;
+      cmdObj = {
+        execute: async (msg, ctx, bot) => fn(msg, ctx, bot)
+      };
+      for (const p of ALL_PROPS) {
+        if (fn[p] !== void 0) cmdObj[p] = fn[p];
+      }
+      for (const key in fn) {
+        if (!ALL_PROPS.includes(key) && key !== "execute") {
+          cmdObj[key] = fn[key];
+        }
+      }
+    } else {
+      cmdObj = { ...command };
+    }
+    const names = this.getNames(cmdObj);
+    if (names.length === 0) return;
+    this.commands.push(cmdObj);
+    if (cmdObj.category) this.categories.add(cmdObj.category);
+    const filePath = cmdObj.__filePath;
+    if (filePath) {
+      const normalizedPath = resolve(filePath);
+      this.fileCommandMap.set(normalizedPath, names);
+    }
+  }
+  registerBeforeHandler(handler) {
+    this.beforeHandlers.push(handler);
+  }
+  unregister(commandName) {
+    const before = this.commands.length;
+    this.commands = this.commands.filter((cmd) => !this.getNames(cmd).includes(commandName.toLowerCase()));
+    return this.commands.length < before;
+  }
+  getNames(cmd) {
+    const names = [];
+    if (cmd.command) {
+      const cmdNames = Array.isArray(cmd.command) ? cmd.command : [cmd.command];
+      names.push(...cmdNames);
+    }
+    if (cmd.name) names.push(cmd.name);
+    if (cmd.aliases) names.push(...cmd.aliases);
+    return names.map((n) => n.toLowerCase());
+  }
+  findCommand(name) {
+    return this.commands.find((cmd) => this.getNames(cmd).includes(name.toLowerCase())) ?? null;
+  }
+  getCommandsByCategory(category) {
+    return category ? this.commands.filter((cmd) => cmd.category === category) : [...this.commands];
+  }
+  getAllCategories() {
+    return Array.from(this.categories);
+  }
+  getAll() {
+    return [...this.commands];
+  }
+  use(middleware) {
+    this.middlewares.push(middleware);
+  }
+  before(handler) {
+    this.beforeHandlers.push(handler);
+  }
+  after(handler) {
+    this.afterHandlers.push(handler);
+  }
+  async processMessage(msg, ctx, config) {
+    if (!msg.body) return false;
+    const context = {
+      conn: ctx.sock,
+      text: msg.body,
+      args: [],
+      command: "",
+      prefix: "",
+      bot: ctx
+    };
+    for (const handler of this.beforeHandlers) {
+      try {
+        let result;
+        if (handler.length === 2) {
+          result = await handler(msg, context);
+        } else {
+          result = await handler(msg, context, this.bot);
+        }
+        if (result === true) return true;
+      } catch (error) {
+        logger_default.error(`[${(/* @__PURE__ */ new Date()).toISOString()}] Error in before handler: ${error.message}`);
+      }
+    }
+    for (const cmd of this.commands) {
+      if (cmd.before) {
+        try {
+          const result = await cmd.before(msg, context, this.bot);
+          if (result === true) return true;
+        } catch (error) {
+          logger_default.error(`[${(/* @__PURE__ */ new Date()).toISOString()}] Error in command before ${error.message}`);
+        }
+      }
+    }
+    const text = msg.body.trim();
+    const prefixes = config || ["."];
+    const extracted = extractPrefix(text, prefixes);
+    if (extracted) {
+      const cmd = this.findCommand(extracted.command);
+      if (!cmd?.execute) return false;
+      const cmdContext = {
+        conn: ctx.sock,
+        text: extracted.args.join(" "),
+        args: extracted.args,
+        command: extracted.command,
+        prefix: extracted.prefix,
+        bot: ctx
+      };
+      let executed = false;
+      await this.runMiddlewares(msg, async () => {
+        await this.executeCommand(cmd, msg, cmdContext);
+        executed = true;
+      });
+      if (!executed) return false;
+      if (cmd.after) {
+        try {
+          await cmd.after(msg, cmdContext, this.bot);
+        } catch (error) {
+        }
+      }
+      for (const handler of this.afterHandlers) {
+        try {
+          await handler(msg, { command: extracted.command, args: extracted.args, context: cmdContext });
+        } catch (error) {
+        }
+      }
+      return true;
+    }
+    for (const cmd of this.commands) {
+      if (cmd.usePrefix === false && cmd.execute) {
+        const args = text.split(/\s+/);
+        const cmdName = args.shift()?.toLowerCase() || "";
+        if (this.getNames(cmd).includes(cmdName)) {
+          const cmdContext = {
+            conn: ctx.sock,
+            text: args.join(" "),
+            args,
+            command: cmdName,
+            prefix: "",
+            bot: ctx
+          };
+          await this.executeCommand(cmd, msg, cmdContext);
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+  async executeCommand(cmd, msg, context) {
+    const checks = [
+      [cmd.disabled, "disabled"],
+      [cmd.owner && !msg.isOwner, "owner"],
+      [cmd.group && !msg.isGroup, "group"],
+      [cmd.admin && !msg.isAdmin, "admin"],
+      [cmd.private && msg.isGroup, "private"],
+      [cmd.botAdmin && !msg.isBotAdmin, "botAdmin"]
+    ];
+    for (const [failed, type, extra] of checks) {
+      if (failed) {
+        await cmdControl(this.bot, msg, type, extra);
+        return;
+      }
+    }
+    if (cmd.cooldown) {
+      if (!global.cooldownCache) global.cooldownCache = /* @__PURE__ */ new Map();
+      const key = `${msg.sender}:${this.getNames(cmd)[0]}`;
+      const now = Date.now();
+      const lastUsed = global.cooldownCache.get(key);
+      if (lastUsed) {
+        const timePassed = (now - lastUsed) / 1e3;
+        const remaining = Math.ceil(cmd.cooldown - timePassed);
+        if (remaining > 0) {
+          await cmdControl(this.bot, msg, "cooldown", remaining);
+          return;
+        }
+      }
+    }
+    msg.args = context.args;
+    msg.prefix = context.prefix;
+    msg.command = Array.isArray(cmd.command) ? cmd.command[0] : cmd.command || "unknown";
+    try {
+      await cmd.execute(msg, context, this.bot);
+      if (cmd.cooldown) {
+        const key = `${msg.sender}:${this.getNames(cmd)[0]}`;
+        global.cooldownCache.set(key, Date.now());
+      }
+    } catch (error) {
+      logger_default.error(`Error executing command ${msg.command}: ${error.message}`);
+      await cmdControl(this.bot, msg, "error", error);
+    }
+  }
+  async runMiddlewares(msg, final) {
+    let i = 0;
+    const next = async () => {
+      i < this.middlewares.length ? await this.middlewares[i++](msg, next) : await final();
+    };
+    await next();
+  }
+  clearCooldowns() {
+    if (global.cooldownCache) global.cooldownCache.clear();
+  }
+  getStats() {
+    return {
+      total: this.commands.length,
+      categories: this.categories.size,
+      middlewares: this.middlewares.length
+    };
+  }
+  async loadFile(filePath) {
+    try {
+      const normalizedPath = resolve(filePath);
+      const commands = await this.importFile(normalizedPath);
+      if (commands) {
+        const cmdArray = Array.isArray(commands) ? commands : [commands];
+        for (const cmd of cmdArray) {
+          if (typeof cmd === "function") {
+            cmd.__filePath = normalizedPath;
+            this.registerBeforeHandler(cmd);
+            const fileName = normalizedPath.split(/[\/\\]/).pop();
+          } else if (cmd && cmd.execute) {
+            cmd.__filePath = normalizedPath;
+            this.register(cmd);
+          }
+        }
+      }
+    } catch (error) {
+      logger_default.error(`[${(/* @__PURE__ */ new Date()).toISOString()}] ${filePath}: ${error.message}`);
+    }
+  }
+  async importFile(filePath) {
+    const normalizedPath = resolve(filePath);
+    const isESM = this.isESMFile(normalizedPath);
+    try {
+      if (isESM) {
+        const fileUrl = pathToFileURL(normalizedPath).href;
+        const cacheBuster = `reload=${Date.now()}&r=${Math.random().toString(36).substring(7)}`;
+        const module = await import(`${fileUrl}?${cacheBuster}`);
+        const exported = module.default ?? module;
+        return this.normalizeExports(exported, normalizedPath);
+      } else {
+        const require2 = createRequire(import.meta.url);
+        try {
+          const resolvedPath = require2.resolve(normalizedPath);
+          delete require2.cache[resolvedPath];
+          const exported = require2(resolvedPath);
+          return this.normalizeExports(exported, normalizedPath);
+        } catch {
+          const fileUrl = pathToFileURL(normalizedPath).href;
+          const module = await import(`${fileUrl}?t=${Date.now()}`);
+          const exported = module.default ?? module;
+          return this.normalizeExports(exported, normalizedPath);
+        }
+      }
+    } catch (error) {
+      logger_default.error(`[${(/* @__PURE__ */ new Date()).toISOString()}] ${filePath}: ${error.message}`);
+      return null;
+    }
+  }
+  isESMFile(filePath) {
+    const ext = filePath.split(".").pop()?.toLowerCase();
+    if (ext === "mjs") return true;
+    if (ext === "cjs") return false;
+    if (ext === "js" || ext === "ts") {
+      try {
+        const fs = __require("fs");
+        const path = __require("path");
+        let dir = path.dirname(filePath);
+        const root = path.parse(dir).root;
+        while (dir !== root) {
+          const pkgPath = path.join(dir, "package.json");
+          if (fs.existsSync(pkgPath)) {
+            const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+            return pkg.type === "module";
+          }
+          dir = path.dirname(dir);
+        }
+      } catch {
+      }
+    }
+    return true;
+  }
+  normalizeExports(exported, filePath) {
+    if (!exported) return null;
+    if (Array.isArray(exported)) {
+      return exported.map((item) => this.normalizeExports(item, filePath)).filter(Boolean);
+    }
+    if (typeof exported === "function") {
+      const fnName = exported.name || "";
+      const fnString = exported.toString();
+      if (fnName === "before" || fnString.includes("function before")) {
+        return exported;
+      }
+      if (exported.execute || exported.command || exported.name || exported.aliases) {
+        const cmd2 = { execute: exported };
+        for (const prop of ALL_PROPS) {
+          if (exported[prop] !== void 0) {
+            cmd2[prop] = exported[prop];
+          }
+        }
+        return cmd2;
+      }
+      return exported;
+    }
+    if (typeof exported === "object") {
+      if (exported.execute && typeof exported.execute === "function") {
+        return { ...exported };
+      } else if (exported.default) {
+        return this.normalizeExports(exported.default, filePath);
+      } else {
+        const fnKeys = ["run", "handler", "handle", "exec", "main"];
+        for (const key of fnKeys) {
+          if (typeof exported[key] === "function") {
+            return { ...exported, execute: exported[key] };
+          }
+        }
+      }
+    }
+    const cmd = { ...exported };
+    if (cmd.execute) {
+      if (!cmd.command && !cmd.name) {
+        const fileName = filePath.split(/[\/\\]/).pop()?.replace(/\.[^.]+$/, "");
+        if (fileName) cmd.command = [fileName];
+      }
+      return cmd;
+    }
+    return null;
+  }
+  startWatching(commandsPath) {
+    if (this.watcher) {
+      this.watcher.close();
+      this.watcher = null;
+    }
+    const absolutePath = resolve(process.cwd(), commandsPath);
+    this.watchedPath = absolutePath;
+    if (!existsSync(absolutePath)) {
+      logger_default.error(`Path does not exist: ${absolutePath}`);
+      return;
+    }
+    this.watcher = watch(absolutePath, {
+      ignored: [/(^|[\/\\])\../, /node_modules/, /\.git/],
+      persistent: true,
+      ignoreInitial: true,
+      awaitWriteFinish: { stabilityThreshold: 300, pollInterval: 100 },
+      depth: 99,
+      usePolling: true,
+      interval: 1e3,
+      binaryInterval: 1e3,
+      alwaysStat: true,
+      atomic: true
+    });
+    this.watcher.on("ready", () => logger_default.done("Watcher ready")).on("add", (path) => {
+      if (!this.isCommandFile(path)) return;
+      logger_default.info(`[${(/* @__PURE__ */ new Date()).toISOString()}] New: ${this.getRelativePath(path)} \u{1F4E5}`);
+      this.loadFile(path).catch((err) => logger_default.error(`[${(/* @__PURE__ */ new Date()).toISOString()}] error ${err.message}`));
+    }).on("change", (path) => {
+      if (!this.isCommandFile(path)) return;
+      logger_default.info(`[${(/* @__PURE__ */ new Date()).toISOString()}] Changed: ${this.getRelativePath(path)} \u{1F504}`);
+      this.reloadFile(path).catch((err) => logger_default.error(`[${(/* @__PURE__ */ new Date()).toISOString()}] error ${err.message}`));
+    }).on("unlink", (path) => {
+      if (!this.isCommandFile(path)) return;
+      console.log(`[${(/* @__PURE__ */ new Date()).toISOString()}] Deleted: ${this.getRelativePath(path)} \u{1F5D1}\uFE0F`);
+      this.unloadFile(path);
+    }).on("error", (error) => logger_default.error(` Watcher error: ${error.message}`));
+  }
+  async reloadFile(filePath) {
+    const normalizedPath = resolve(filePath);
+    this.unloadFile(normalizedPath);
+    await new Promise((resolve2) => setTimeout(resolve2, 500));
+    await this.loadFile(normalizedPath);
+  }
+  unloadFile(filePath) {
+    const normalizedPath = resolve(filePath);
+    const commandNames = this.fileCommandMap.get(normalizedPath);
+    if (!commandNames?.length) {
+      this.commands = this.commands.filter((cmd) => {
+        const cmdPath = cmd.__filePath;
+        return !cmdPath || resolve(cmdPath) !== normalizedPath;
+      });
+    } else {
+      commandNames.forEach((name) => this.unregister(name));
+    }
+    this.beforeHandlers = this.beforeHandlers.filter((handler) => {
+      const handlerPath = handler.__filePath;
+      return !handlerPath || resolve(handlerPath) !== normalizedPath;
+    });
+    this.fileCommandMap.delete(normalizedPath);
+  }
+  isCommandFile(filePath) {
+    const ext = filePath.split(".").pop()?.toLowerCase();
+    return ["js", "ts", "mjs", "cjs"].includes(ext || "");
+  }
+  getRelativePath(filePath) {
+    try {
+      return relative(this.watchedPath, filePath);
+    } catch {
+      return filePath;
+    }
+  }
+  stopWatcher() {
+    if (this.watcher) {
+      this.watcher.close();
+      this.watcher = null;
+      console.log("\u{1F6D1} Watcher stopped");
+    }
+  }
+};
+async function loadCommandsFromPath(commandsPath, commandSystem) {
+  const absolutePath = resolve(process.cwd(), commandsPath);
+  const scanDir = async (dir) => {
+    try {
+      const items = await readdir(dir, { withFileTypes: true });
+      for (const item of items) {
+        const fullPath = join(dir, item.name);
+        if (item.isDirectory()) {
+          await scanDir(fullPath);
+        } else if (item.isFile()) {
+          const ext = item.name.split(".").pop()?.toLowerCase();
+          if (ext && ["js", "ts", "mjs", "cjs"].includes(ext) && commandSystem) {
+            await commandSystem.loadFile(fullPath);
+          }
+        }
+      }
+    } catch (error) {
+      logger_default.error(`${dir}: ${error.message}`);
+    }
+  };
+  await scanDir(absolutePath);
+  if (commandSystem) {
+    commandSystem.startWatching(commandsPath);
+  }
+  return commandSystem?.getAll() || [];
+}
+if (!global.cooldownCache) {
+  global.cooldownCache = /* @__PURE__ */ new Map();
+}
+var OwnerSchema2 = z.object({
+  lid: z.string(),
+  jid: z.string(),
+  name: z.string().optional()
+}).strict();
+var BotConfigSchema = z.object({
+  phoneNumber: z.string().regex(/^(\+?\d+|0\d+)$/, "Invalid phone number format"),
+  namebot: z.string().optional(),
+  fromMe: z.boolean().nullable().default(null),
+  sessionPath: z.string().default("./session"),
+  autoReconnect: z.boolean().default(true),
+  reconnectDelay: z.number().min(1e3).default(3e3),
+  maxReconnectAttempts: z.number().min(1).default(10),
+  showLogs: z.boolean().default(false),
+  printQR: z.boolean().default(false),
+  markOnline: z.boolean().default(false),
+  browser: z.string().default(["Chrome", "Firefox", "Safari", "Edge"][Math.floor(Math.random() * 4)]),
+  syncHistory: z.boolean().default(false),
+  autoRead: z.boolean().default(false),
+  linkPreview: z.boolean().default(true),
+  owners: z.array(OwnerSchema2).default([]),
+  commandsPath: z.string().default("./plugins"),
+  prefix: z.union([z.string(), z.array(z.string())]).default("!"),
+  onConnected: z.function().optional(),
+  onDisconnected: z.function().optional(),
+  onError: z.custom().optional()
+}).strict();
+z.object({
+  id: z.string().optional(),
+  body: z.string(),
+  text: z.string(),
+  from: z.string(),
+  name: z.string().optional(),
+  pushName: z.string().optional(),
+  timestamp: z.date(),
+  isGroup: z.boolean(),
+  isOwner: z.boolean(),
+  isAdmin: z.boolean(),
+  isBotAdmin: z.boolean(),
+  fromMe: z.boolean(),
+  key: z.any().optional(),
+  message: z.any().optional(),
+  raw: z.any(),
+  args: z.array(z.string()).optional(),
+  command: z.string().optional(),
+  prefix: z.string().optional(),
+  sender: z.string(),
+  chat: z.string(),
+  reply: z.custom(),
+  react: z.custom(),
+  lid2jid: z.custom().optional(),
+  jid2lid: z.custom().optional(),
+  delete: z.custom(),
+  download: z.custom(),
+  forward: z.custom(),
+  typing: z.custom(),
+  recording: z.custom()
+}).strict();
+z.object({
+  id: z.string(),
+  chat: z.string(),
+  userUrl: z.string().optional(),
+  participants: z.array(z.string()),
+  action: z.enum(["add", "remove", "promote", "demote"]),
+  author: z.string().optional(),
+  authorUrl: z.string().optional(),
+  timestamp: z.date()
+}).strict();
+z.object({
+  conn: z.any(),
+  text: z.string(),
+  args: z.array(z.string()),
+  command: z.string(),
+  prefix: z.string(),
+  bot: z.any()
+}).strict();
+z.object({
+  name: z.string().optional(),
+  command: z.union([z.string(), z.array(z.string())]).optional(),
+  aliases: z.array(z.string()).optional(),
+  description: z.string().optional(),
+  category: z.string().optional(),
+  usage: z.string().optional(),
+  cooldown: z.number().optional(),
+  ownerOnly: z.boolean().optional(),
+  groupOnly: z.boolean().optional(),
+  privateOnly: z.boolean().optional(),
+  botAdmin: z.boolean().optional(),
+  disabled: z.boolean().optional(),
+  usePrefix: z.boolean().optional(),
+  before: z.custom().optional(),
+  after: z.custom().optional(),
+  execute: z.custom().optional()
+}).strict().catchall(z.any());
+var connection_event = async (OOP, isNewSession) => {
+  try {
+    const { sock } = OOP;
+    sock.ev.on("connection.update", (update) => {
+      const { connection, lastDisconnect, qr } = update;
+      const { config, reconnectTimeout, reconnectAttempts } = OOP;
+      const { showLogs, printQR, autoReconnect, maxReconnectAttempts, reconnectDelay, onConnected, onDisconnected, namebot } = config;
+      if (qr && printQR && showLogs) {
+        logger_default.line();
+        logger_default.done("Scan QR code to login \u2193");
+        qrTerminal.generate(qr, { small: true });
+        logger_default.line();
+      }
+      if (connection === "close") {
+        if (reconnectTimeout) {
+          clearTimeout(reconnectTimeout);
+        }
+        if (lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut) {
+          if (showLogs) {
+            logger_default.error(" Session logged out. Please re-pair the device.");
+          }
+          OOP.isRunning = false;
+          if (onDisconnected) {
+            onDisconnected();
+          }
+          return;
+        }
+        if (autoReconnect) {
+          if (reconnectAttempts < maxReconnectAttempts) {
+            OOP.reconnectAttempts++;
+            if (showLogs) {
+              logger_default.loading(`Reconnecting... (${OOP.reconnectAttempts} ~ ${maxReconnectAttempts})`);
+            }
+            OOP.reconnectTimeout = setTimeout(() => OOP.restart(), reconnectDelay);
+          } else {
+            OOP.isRunning = false;
+            if (onDisconnected) {
+              onDisconnected();
+            }
+          }
+        } else {
+          OOP.isRunning = false;
+          if (onDisconnected) {
+            onDisconnected();
+          }
+        }
+      }
+      if (connection === "open") {
+        (async () => {
+          await sock.uploadPreKeysToServerIfRequired();
+          await sock.KeysMessageWA();
+        })();
+        OOP.reconnectAttempts = 0;
+        if (reconnectTimeout) {
+          clearTimeout(reconnectTimeout);
+        }
+        if (onConnected) {
+          onConnected();
+        }
+        if (showLogs) {
+          logger_default.clear();
+          logger_default.random(`${namebot || "WhatsApp Bot"} started successfully`);
+          console.log(`      ______ ______
+    _/      Y      _
+   // ~~ ~~ | ~~ ~  \\
+  // ~ ~ ~~ | ~~~ ~~ \\      Original ${namebot || "WhatsApp Bot"}
+ //________.|.________\\     Created by: ${color("@veni_xov", "yellow")}
+\`----------\`-'----------'`);
+          logger_default.line();
+          logger_default.info("Bot Engine    : Vii7/whatsapp");
+          logger_default.info("Backend       : Node.js & Type Script");
+          logger_default.line();
+        }
+      }
+    });
+  } catch (error) {
+    if (OOP.config.onError) {
+      if (typeof OOP.config.onError === "function") {
+        OOP.config.onError(error);
+      }
+    }
+  }
+};
+var connection_events_default = connection_event;
+
+// src/events/group.event.ts
+var group_event = (OOP) => {
+  OOP.sock.ev.on("group-participants.update", async (data) => {
+    try {
+      const metadata = await OOP.sock.groupMetadata(data.id);
+      const authorJid = data.author;
+      const authorParticipant = metadata.participants.find((x) => x.id === authorJid);
+      const authorPhoneNumber = authorParticipant?.phoneNumber || authorJid;
+      let ppAuthor = "https://files.catbox.moe/hm9iq4.jpg";
+      try {
+        if (authorJid) {
+          ppAuthor = await OOP.sock.profilePictureUrl(authorJid, "image") || ppAuthor;
+        }
+      } catch (e) {
+        console.log(e.message);
+      }
+      let ppUser = "https://files.catbox.moe/hm9iq4.jpg";
+      try {
+        if (data.participants && data.participants.length > 0) {
+          const participantJid = data.participants[0].id;
+          ppUser = await OOP.sock.profilePictureUrl(participantJid, "image") || ppUser;
+        }
+      } catch (e) {
+        console.log(e.message);
+      }
+      const event = {
+        id: data.id,
+        chat: data.id,
+        userUrl: ppUser,
+        participants: data.participants,
+        action: data.action,
+        author: authorPhoneNumber,
+        authorUrl: ppAuthor,
+        timestamp: /* @__PURE__ */ new Date()
+      };
+      await OOP.groupControl(event, data.action);
+    } catch (error) {
+      console.error("error", error.message);
+      if (OOP.config.onError && typeof OOP.config.onError === "function") {
+        OOP.config.onError(error);
+      }
+    }
+  });
+};
+var group_event_default = group_event;
+
+// src/uilts/print.ts
+var print = (m, cil) => {
+  if (!cil.config.showLogs) return;
+  if (Array.isArray(m)) {
+    m = m[0];
+  }
+  if (!m || !m.key) {
+    logger_default.warn("Invalid message object received");
+    return;
+  }
+  const sender = m.pushName || "Unknown";
+  const remoteJid = m.key.remoteJid || "N/A";
+  const timestamp = m.messageTimestamp ? new Date(m.messageTimestamp * 1e3).toLocaleString() : "Unknown";
+  const chatType = remoteJid.includes("@g.us") ? "\u{1F465} Group" : "\u{1F464} Private";
+  let messageType = "Unknown";
+  let messageContent = "";
+  if (m.message) {
+    if (m.message.conversation) {
+      messageType = "Text";
+      messageContent = m.message.conversation;
+    } else if (m.message.imageMessage) {
+      messageType = "Image";
+      messageContent = m.message.imageMessage.caption || "No caption";
+    } else if (m.message.videoMessage) {
+      messageType = "Video";
+      messageContent = m.message.videoMessage.caption || "No caption";
+    } else if (m.message.stickerMessage) {
+      messageType = "Sticker";
+      messageContent = "\u{1F9E9} Sticker";
+    } else if (m.message.documentMessage) {
+      messageType = "Document";
+      messageContent = m.message.documentMessage.title || "Document";
+    } else if (m.message.audioMessage) {
+      messageType = "Audio";
+      messageContent = m.message.audioMessage.seconds ? `${m.message.audioMessage.seconds}s` : "Audio";
+    } else if (m.message.contactMessage) {
+      messageType = "Contact";
+      messageContent = m.message.contactMessage.displayName || "Contact";
+    } else if (m.message.locationMessage) {
+      messageType = "Location";
+      messageContent = "\u{1F4CD} Location";
+    } else if (m.message.reactionMessage) {
+      messageType = "Reaction";
+      messageContent = m.message.reactionMessage.text || "\u{1F44D}";
+    } else if (m.message.extendedTextMessage) {
+      messageType = "Extended Text";
+      messageContent = m.message.extendedTextMessage.text || "";
+    } else if (m.message.protocolMessage) {
+      messageType = "Protocol";
+      messageContent = "Protocol message";
+    } else {
+      messageType = "Other";
+      messageContent = "Complex message type";
+    }
+  }
+  console.log("\u256D\u2500\u2508\u2500 " + color("Message status", "yellow") + "\u2322\u1DFC\u0336\u2500\u1422\u05C4\u1BAB \u05C5\u279B");
+  console.log(`\u2318 From: ${color(sender, "blue")}`);
+  console.log(`\u2318 Chat: ${color(remoteJid, "green")}`);
+  console.log(`\u2318 Type: ${color(chatType, "yellow")}`);
+  console.log(`\u2318 Time: ${color(timestamp, "magenta")}`);
+  console.log(`\u2318 Message Type: ${color(messageType, "cyan")}`);
+  console.log("\u2570\u2550\u0361\u2D7F\u2500\u2508\u2500\u2508\u2500 > \u{13211}");
+  console.log(`\u256D\u2500\u2508\u2500 ${color("Message Content", "magenta")} \u2322\u1DFC\u0336\u2500\u1422\u05C4\u1BAB \u05C5\u279B
+\u2726 Content: ${color(messageContent, "yellow")}
+\u2570\u2550\u0361\u2D7F\u2500\u2508\u2500\u2508\u2500 > \u{144B1}
+`);
+};
+var print_default = print;
+
+// src/events/message.event.ts
+var message_event = (OOP) => {
+  OOP.sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    if (type !== "notify" || !OOP.sock) return;
+    print_default(messages, OOP);
+    for (const msg of messages) {
+      if (!msg.message) continue;
+      if (msg.message?.protocolMessage || msg.message?.senderKeyDistributionMessage || msg.message?.stickerSyncRmrMessage) {
+        continue;
+      }
+      if (OOP.config.autoRead) await OOP.sock.readMessages([msg.key]);
+      try {
+        const messageObj = await msgObj(msg, OOP.sock, OOP.config.owners);
+        if (!messageObj) continue;
+        if (OOP.config.fromMe === true && !messageObj.fromMe) continue;
+        if (OOP.config.fromMe === false && messageObj.fromMe) continue;
+        const processed = await OOP.commandSystem.processMessage(messageObj, OOP, OOP.config.prefix);
+        if (!processed) {
+          for (const handler of OOP.handlers) {
+            try {
+              const response = await handler(messageObj);
+              if (response) {
+                if (typeof response === "string") {
+                  await messageObj.reply(response);
+                } else if (typeof response === "object") {
+                  await messageObj.reply(response.text || "", response);
+                }
+                break;
+              }
+            } catch (error) {
+              if (OOP.config.onError && typeof OOP.config.onError === "function") OOP.config.onError(error);
+            }
+          }
+        }
+      } catch (error) {
+        if (OOP.config.onError && typeof OOP.config.onError === "function") OOP.config.onError(error);
+      }
+    }
+  });
+};
+var message_event_default = message_event;
+
+// src/uilts/scrapy.ts
+var scrapy = {
+  test: async (url) => {
+    try {
+      const res = await fetch(url);
+      return res.text();
+    } catch {
+      return false;
+    }
+  }
+};
+var scrapy_default = scrapy;
+
+// src/uilts/loadCmds.ts
+var loadCommands = async (OOP) => {
+  try {
+    await loadCommandsFromPath(OOP.config.commandsPath, OOP.commandSystem);
+    if (OOP.config.showLogs) {
+      console.log(color(`       _,    _   _    ,_
+  .o888P     Y8o8Y     Y888o.
+ d88888      88888      88888b
+d888888b_  _d88888b_  _d888888b
+8888888888888888888888888888888
+8888888888888888888888888888888
+YJGS8P"Y888P"Y888P"Y888P"Y8888P
+ Y888   '8'   Y8P   '8'   888Y
+  '8o          V          o8'
+    \`                     \``, "red"));
+      logger_default.line();
+      logger_default.info(`Loaded (${OOP.commandSystem.getAll().length}) commands in "${OOP.config.commandsPath}"`);
+      logger_default.info(`Name Bot: ${OOP.namebot || "WhatsApp Bot"}`);
+      logger_default.line();
+    }
+    ;
+  } catch (error) {
+    logger_default.error(`[${(/* @__PURE__ */ new Date()).toLocaleTimeString()}] Error loading Commands: ${error.message}`);
+  }
+};
+var loadCmds_default = loadCommands;
+
+// src/index.ts
+var WhatsAppBot = class {
+  constructor(config) {
+    this.sock = null;
+    this.sockBaileys = null;
+    this.scrapy = scrapy_default;
+    this.handlers = [];
+    this.userAccessHandler = null;
+    this.userGroupEventHandler = null;
+    this.reconnectTimeout = null;
+    this.reconnectAttempts = 0;
+    this.isRunning = false;
+    this.maxReconnectAttempts = 5;
+    this.credsSaver = null;
+    this.cleanup = async () => {
+      try {
+        if (this.reconnectTimeout) {
+          clearTimeout(this.reconnectTimeout);
+          this.reconnectTimeout = null;
+        }
+        if (this.sock) {
+          this.sock.ws?.close();
+          this.sock = null;
+          this.sockBaileys = null;
+        }
+        if (this.config.showLogs) {
+          logger_default.done("Cleanup completed");
+        }
+      } catch (error) {
+        logger_default.error(`Cleanup error: ${error}`);
+      }
+    };
+    this.config = BotConfigSchema.parse(config);
+    this.commandSystem = new CommandSystem(this);
+    this.setupExit();
+  }
+  setupExit() {
+    const exit = async (signal) => {
+      if (this.config.showLogs) {
+        logger_default.loading(`Received ${signal}, cleaning up...`);
+      }
+      if (this.sock?.ws?.readyState === 1) {
+        this.sock.KeysMessageWA();
+      }
+      await this.cleanup();
+      process.exit(0);
+    };
+    process.on("SIGINT", () => exit("SIGINT"));
+    process.on("SIGTERM", () => exit("SIGTERM"));
+  }
+  onCommandAccess(handler) {
+    this.userAccessHandler = handler;
+  }
+  onGroupEvent(handler) {
+    this.userGroupEventHandler = handler;
+  }
+  onMessage(handler) {
+    this.handlers.push(handler);
+  }
+  onBeforeCommand(handler) {
+    this.commandSystem.before(handler);
+  }
+  onAfterCommand(handler) {
+    this.commandSystem.after(handler);
+  }
+  async cmdControl(msg, checkType, ...args) {
+    await cmdControl(this, msg, checkType, ...args);
+  }
+  async groupControl(event, eventType) {
+    await groupControl(this, event, eventType);
+  }
+  async start() {
+    if (this.isRunning) {
+      logger_default.warn("Bot is already running");
+      return;
+    }
+    try {
+      await loadCmds_default(this);
+      const { version } = await fetchLatestBaileysVersion();
+      const { state, saveCreds } = await useMultiFileAuthState(this.config.sessionPath);
+      this.credsSaver = saveCreds;
+      const isNewSession = !state.creds.registered;
+      if (isNewSession && !this.config.printQR && this.config.showLogs && this.config.phoneNumber) {
+        logger_default.done("New session - Waiting for pairing...");
+        logger_default.info(`Phone number: ${this.config.phoneNumber}`);
+        setTimeout(async () => {
+          try {
+            if (this.sock) {
+              const code = await this.sock.requestPairingCode(this.config.phoneNumber, Buffer.from("56454e4931323334", "hex").toString());
+              console.log(`\u{1F510} Pairing Code ${color(code, "yellow")}`);
+              logger_default.line();
+            }
+          } catch (error) {
+            logger_default.error(`Pairing error: ${error.message}`);
+          }
+        }, 2e3);
+      }
+      this.sockBaileys = makeWASocket({
+        version,
+        auth: state,
+        logger: pino({ level: "silent" }),
+        browser: Browsers.ubuntu(this.config.browser),
+        printQRInTerminal: isNewSession && this.config.printQR,
+        markOnlineOnConnect: this.config.markOnline,
+        syncFullHistory: this.config.syncHistory,
+        generateHighQualityLinkPreview: this.config.linkPreview
+      });
+      if (this.sockBaileys) {
+        this.sock = await sockMyFun(this.sockBaileys);
+        this.setupEvents(saveCreds, isNewSession);
+      }
+      this.isRunning = true;
+      this.reconnectAttempts = 0;
+    } catch (error) {
+      logger_default.error(`Failed to start bot: ${error instanceof Error ? error.message : "Unknown error"}`);
+      if (this.config.onError && typeof this.config.onError === "function") {
+        this.config.onError(error);
+      }
+      if (this.config.autoReconnect && this.reconnectAttempts < this.maxReconnectAttempts) {
+        this.scheduleReconnect();
+      }
+    }
+  }
+  setupEvents(saveCreds, isNewSession) {
+    if (!this.sock) return;
+    this.sock.ev.on("creds.update", saveCreds);
+    connection_events_default(this);
+    group_event_default(this);
+    message_event_default(this);
+  }
+  scheduleReconnect() {
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+    }
+    this.reconnectAttempts++;
+    const delay = this.config.reconnectDelay * this.reconnectAttempts;
+    logger_default.info(`Scheduling reconnect attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts} in ${delay}ms`);
+    this.reconnectTimeout = setTimeout(() => this.restart(), delay);
+  }
+  async restart() {
+    logger_default.warn("Attempting to restart bot...");
+    await this.cleanup();
+    process.exit(0);
+  }
+  async stop() {
+    logger_default.info("Stopping bot...");
+    await this.cleanup();
+  }
+  registerCommand(command) {
+    this.commandSystem.register(command);
+  }
+  unregisterCommand(commandName) {
+    return this.commandSystem.unregister(commandName);
+  }
+  getCommand(commandName) {
+    return this.commandSystem.findCommand(commandName);
+  }
+  getAllCommands() {
+    return this.commandSystem.getAll();
+  }
+  useMiddleware(middleware) {
+    this.commandSystem.use(middleware);
+  }
+  clearCooldowns() {
+    this.commandSystem.clearCooldowns();
+  }
+  getOwners() {
+    return this.config.owners;
+  }
+  isOwner(jid) {
+    return this.config.owners.some((o) => o.jid === jid);
+  }
+  isConnected() {
+    return this.isRunning && this.sock !== null && this.sock.user !== void 0;
+  }
+};
+var createWhatsAppBot = (config) => new WhatsAppBot(config);
+
+export { WhatsAppBot, createWhatsAppBot };
+//# sourceMappingURL=index.mjs.map
+//# sourceMappingURL=index.mjs.map
