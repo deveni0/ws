@@ -1,0 +1,66 @@
+{
+  "name": "whatsappy",
+  "version": "1.0.1",
+  "description": "A professional and powerful WhatsApp bot framework built on Baileys. Create sophisticated bots with ease - just initialize the bot, define your message handlers and routes, and you're ready to go. Features built-in keyboard system, message parsing, middleware support, and comprehensive event handling for building production-ready WhatsApp bots.",
+  "license": "MIT",
+  "author": {
+    "name": "VENi Youssefv",
+    "url": "https://github.com/deveni0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/deveni0/ws.git"
+  },
+  "bugs": {
+    "url": "https://github.com/deveni0/ws/issues"
+  },
+  "homepage": "https://github.com/deveni0/ws#readme",
+  "main": "dist/index.cjs",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "dev": "nodemon --exec ts-node src/index.ts",
+    "build": "tsup src/index.ts --format esm,cjs --dts --clean",
+    "watch": "tsup src/index.ts --format esm,cjs --dts --watch",
+    "start": "node dist/index.cjs"
+  },
+  "keywords": [
+    "whatsapp",
+    "bot",
+    "baileys",
+    "whatsapp-bot",
+    "chatbot",
+    "keyboard",
+    "whatsapp-api",
+    "bot-library",
+    "whatsapp-library"
+  ],
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "cheerio": "1.0.0-rc.12",
+    "pino": "^10.3.0",
+    "qrcode-terminal": "^0.12.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.10",
+    "nodemon": "^3.1.11",
+    "ts-node": "^10.9.2",
+    "tsup": "^8.5.1",
+    "typescript": "^4.9.5"
+  }
+}
