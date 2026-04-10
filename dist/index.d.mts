@@ -1,15 +1,10 @@
-import { AnyMessageContent, WAMessage, WASocket } from '@whiskeysockets/baileys';
 import { z } from 'zod';
+import { AnyMessageContent, WAMessage, WASocket } from '@whiskeysockets/baileys';
 import { AxiosInstance } from 'axios';
+import { EventEmitter } from 'events';
 
-declare const OwnerSchema: z.ZodObject<{
-    lid: z.ZodString;
-    jid: z.ZodString;
-    name: z.ZodOptional<z.ZodString>;
-}, z.core.$strict>;
-type Owner = z.infer<typeof OwnerSchema>;
 declare const BotConfigSchema: z.ZodObject<{
-    phoneNumber: z.ZodString;
+    phoneNumber: z.ZodDefault<z.ZodOptional<z.ZodUnion<readonly [z.ZodPipe<z.ZodPipe<z.ZodString, z.ZodTransform<string, string>>, z.ZodString>, z.ZodLiteral<"">]>>>;
     info: z.ZodDefault<z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodAny>>>;
     fromMe: z.ZodDefault<z.ZodNullable<z.ZodBoolean>>;
     sessionPath: z.ZodDefault<z.ZodString>;
@@ -18,11 +13,8 @@ declare const BotConfigSchema: z.ZodObject<{
     maxReconnectAttempts: z.ZodDefault<z.ZodNumber>;
     showLogs: z.ZodDefault<z.ZodBoolean>;
     printQR: z.ZodDefault<z.ZodBoolean>;
-    markOnline: z.ZodDefault<z.ZodBoolean>;
     browser: z.ZodDefault<z.ZodString>;
-    syncHistory: z.ZodDefault<z.ZodBoolean>;
     autoRead: z.ZodDefault<z.ZodBoolean>;
-    linkPreview: z.ZodDefault<z.ZodBoolean>;
     owners: z.ZodDefault<z.ZodArray<z.ZodObject<{
         lid: z.ZodString;
         jid: z.ZodString;
@@ -135,9 +127,9 @@ declare class CommandSystem {
     private watcher;
     private beforeHandlers;
     private afterHandlers;
-    private bot;
-    private loadedPaths;
-    private processingMessages;
+    bot: any;
+    private instanceId;
+    private watcherStarted;
     constructor(bot?: any);
     setBot(bot: any): void;
     register(command: CommandOptions | Function): void;
@@ -145,20 +137,20 @@ declare class CommandSystem {
     before(handler: Handler): void;
     after(handler: Handler): void;
     use(middleware: Middleware): void;
-    findCommand(name: string, isOwner?: boolean): CommandOptions | undefined;
-    getCommandsByCategory(category?: string, isOwner?: boolean): CommandOptions[];
+    findCommand(name: string, isOwner?: boolean, isSubBot?: boolean): CommandOptions | undefined;
+    getCommandsByCategory(category?: string, isOwner?: boolean, isSubBot?: boolean): CommandOptions[];
     getAllCategories(): string[];
-    getAll(isOwner?: boolean): CommandOptions[];
+    getAll(isOwner?: boolean, isSubBot?: boolean): CommandOptions[];
     processMessage(msg: Message, ctx: any, config: any): Promise<boolean>;
+    private getGroupParticipants;
     private runBeforeHandlers;
     private runAfterHandlers;
     private getCommandNames;
-    loadFile(filePath: string): Promise<void>;
+    loadFile(filePath: string, forceReload?: boolean): Promise<void>;
     loadDirectory(commandsPath: string): Promise<void>;
     startWatching(commandsPath: string): void;
     stopWatcher(): void;
     private handleFileChange;
-    private reloadFile;
     private unloadFile;
     private resolvePath;
     clearCooldowns(userId?: string): void;
@@ -167,9 +159,9 @@ declare class CommandSystem {
         beforeHandlers: number;
         afterHandlers: number;
         loadedPaths: number;
-        cacheSize: any;
         total: number;
         hidden: number;
+        noSub: number;
         categories: number;
         files: number;
         regexCommands: number;
@@ -177,6 +169,9 @@ declare class CommandSystem {
     abortUserCommands(userId: string): void;
     destroy(): void;
     resetLoadedPaths(): void;
+    static resetSharedCache(): void;
+    static isPathLoaded(path: string): boolean;
+    static stopGlobalWatcher(): void;
 }
 
 declare function getMediaSize(msg: WAMessage): Promise<number>;
@@ -727,6 +722,146 @@ declare const Convert: {
 
 declare const ConvertYt: any;
 
+interface ILogger {
+    info: (m: string, d?: any) => void;
+    error: (m: string, d?: any) => void;
+    warn: (m: string, d?: any) => void;
+    debug: (m: string, d?: any) => void;
+}
+declare class SubBot extends EventEmitter {
+    readonly id: string;
+    readonly index: number;
+    readonly phoneNumber: string;
+    readonly isSubBot = true;
+    sock: WASocket | null;
+    connected: boolean;
+    startedAt: Date | null;
+    msgCount: number;
+    handlers: any[];
+    Api: {
+        download: {
+            [k: string]: (params?: Record<string, string>) => Promise<any>;
+        };
+        search: {
+            [k: string]: (params?: Record<string, string>) => Promise<any>;
+        };
+        tools: {
+            [k: string]: (params?: Record<string, string>) => Promise<any>;
+        };
+    };
+    commandSystem: CommandSystem | null;
+    userAccessHandler: AccessHandler | null;
+    private cfg;
+    private auth;
+    private recMgr;
+    private pairMgr;
+    private stopped;
+    private log;
+    private ctrl;
+    constructor(id: string, idx: number, phone: string, cfg: BotConfig, cs: CommandSystem, log?: ILogger);
+    get config(): BotConfig;
+    set config(c: BotConfig);
+    get owners(): {
+        lid: string;
+        jid: string;
+        name?: string | undefined;
+    }[];
+    onCommandAccess(h: AccessHandler): void;
+    cmdControl(m: Message, t: string, ...a: any[]): Promise<void>;
+    private updPhone;
+    start(v: readonly [number, number, number]): Promise<any>;
+    private setup;
+    private disconnect;
+    private nuke;
+    destroy(): Promise<void>;
+    cleanup(): Promise<void>;
+    updateGlobalConfig(c: BotConfig): void;
+    registerCommand(c: any): void;
+    unregisterCommand(n: string): boolean;
+    getCommand(n: string): {
+        [x: string]: any;
+        name?: string | undefined;
+        command?: string | string[] | undefined;
+        aliases?: string[] | undefined;
+        description?: string | undefined;
+        category?: string | undefined;
+        usage?: string | undefined;
+        cooldown?: number | undefined;
+        owner?: boolean | undefined;
+        group?: boolean | undefined;
+        admin?: boolean | undefined;
+        private?: boolean | undefined;
+        botAdmin?: boolean | undefined;
+        disabled?: boolean | undefined;
+        usePrefix?: boolean | undefined;
+        before?: ((message: Message, context: CommandContext, bot: any) => Promise<any>) | undefined;
+        after?: ((message: Message, context: CommandContext, bot: any) => Promise<any>) | undefined;
+        execute?: ((message: Message, context: CommandContext, bot: any) => Promise<any>) | undefined;
+    } | undefined;
+    getAllCommands(): {
+        [x: string]: any;
+        name?: string | undefined;
+        command?: string | string[] | undefined;
+        aliases?: string[] | undefined;
+        description?: string | undefined;
+        category?: string | undefined;
+        usage?: string | undefined;
+        cooldown?: number | undefined;
+        owner?: boolean | undefined;
+        group?: boolean | undefined;
+        admin?: boolean | undefined;
+        private?: boolean | undefined;
+        botAdmin?: boolean | undefined;
+        disabled?: boolean | undefined;
+        usePrefix?: boolean | undefined;
+        before?: ((message: Message, context: CommandContext, bot: any) => Promise<any>) | undefined;
+        after?: ((message: Message, context: CommandContext, bot: any) => Promise<any>) | undefined;
+        execute?: ((message: Message, context: CommandContext, bot: any) => Promise<any>) | undefined;
+    }[];
+    useMiddleware(m: any): void;
+}
+declare class SubBots extends EventEmitter {
+    private bots;
+    private pMap;
+    private cnt;
+    private shutting;
+    private ver;
+    private gCfg;
+    private sem;
+    private log;
+    private cs;
+    isSubBot: boolean;
+    constructor(cs: CommandSystem, log?: ILogger);
+    private ver_;
+    private gCfg_;
+    setConfig(c: Partial<BotConfig>): Promise<void>;
+    load(): Promise<number>;
+    add(p: string): Promise<string>;
+    remove(id: string): Promise<void>;
+    removeByPhone(p: string): Promise<boolean>;
+    removeByIndex(idx: number): Promise<void>;
+    private force_;
+    stopAll(): Promise<void>;
+    private spawn_;
+    get(id: string): SubBot | undefined;
+    getByPhone(p: string): SubBot | undefined;
+    list(): {
+        id: string;
+        index: number;
+        name: string;
+        phone: string;
+        connected: boolean;
+        started: Date | null;
+        messages: number;
+    }[];
+    stats(): {
+        total: number;
+        connected: number;
+        disconnected: number;
+        totalMessages: number;
+    };
+}
+
 declare class Client {
     sock: WASocket | null;
     Api: {
@@ -742,37 +877,83 @@ declare class Client {
     };
     config: BotConfig;
     commandSystem: CommandSystem;
+    supBot: any | null;
+    isSubBot: boolean;
     private handlers;
     private userAccessHandler;
     private userGroupEventHandler;
-    private reconnectTimeout;
-    private reconnectAttempts;
-    private isRunning;
-    private maxReconnectAttempts;
+    private recMgr;
+    private running;
     private credsSaver;
     constructor(config: BotConfig);
-    private setupExit;
-    onCommandAccess(handler: AccessHandler): void;
-    onGroupEvent(handler: GroupEventHandler): void;
-    onMessage(handler: MessageHandler): void;
-    onBeforeCommand(handler: (msg: Message) => Promise<boolean | void>): void;
-    onAfterCommand(handler: (msg: Message, data: any) => Promise<void>): void;
-    cmdControl(msg: Message, checkType: string, ...args: any[]): Promise<void>;
+    onCommandAccess(h: AccessHandler): void;
+    onGroupEvent(h: GroupEventHandler): void;
+    onMessage(h: MessageHandler): void;
+    onBeforeCommand(h: (m: Message) => Promise<boolean | void>): void;
+    onAfterCommand(h: (m: Message, d: any) => Promise<void>): void;
+    cmdControl(m: Message, t: string, ...a: any[]): Promise<void>;
     private groupControl;
     start(force?: boolean): Promise<void>;
-    private setupEvents;
-    private scheduleReconnect;
+    private setup;
     restart(force?: boolean): Promise<void>;
     stop(): Promise<void>;
     cleanup: () => Promise<void>;
-    registerCommand(command: any): void;
-    unregisterCommand(commandName: string): boolean;
-    getCommand(commandName: string): any;
-    getAllCommands(): any[];
-    useMiddleware(middleware: any): void;
+    registerCommand(c: any): void;
+    unregisterCommand(n: string): boolean;
+    getCommand(n: string): {
+        [x: string]: any;
+        name?: string | undefined;
+        command?: string | string[] | undefined;
+        aliases?: string[] | undefined;
+        description?: string | undefined;
+        category?: string | undefined;
+        usage?: string | undefined;
+        cooldown?: number | undefined;
+        owner?: boolean | undefined;
+        group?: boolean | undefined;
+        admin?: boolean | undefined;
+        private?: boolean | undefined;
+        botAdmin?: boolean | undefined;
+        disabled?: boolean | undefined;
+        usePrefix?: boolean | undefined;
+        before?: ((message: Message, context: CommandContext, bot: any) => Promise<any>) | undefined;
+        after?: ((message: Message, context: CommandContext, bot: any) => Promise<any>) | undefined;
+        execute?: ((message: Message, context: CommandContext, bot: any) => Promise<any>) | undefined;
+    } | undefined;
+    getAllCommands(): {
+        [x: string]: any;
+        name?: string | undefined;
+        command?: string | string[] | undefined;
+        aliases?: string[] | undefined;
+        description?: string | undefined;
+        category?: string | undefined;
+        usage?: string | undefined;
+        cooldown?: number | undefined;
+        owner?: boolean | undefined;
+        group?: boolean | undefined;
+        admin?: boolean | undefined;
+        private?: boolean | undefined;
+        botAdmin?: boolean | undefined;
+        disabled?: boolean | undefined;
+        usePrefix?: boolean | undefined;
+        before?: ((message: Message, context: CommandContext, bot: any) => Promise<any>) | undefined;
+        after?: ((message: Message, context: CommandContext, bot: any) => Promise<any>) | undefined;
+        execute?: ((message: Message, context: CommandContext, bot: any) => Promise<any>) | undefined;
+    }[];
+    useMiddleware(m: any): void;
     clearCooldowns(): void;
-    getOwners(): Owner[];
+    getOwners(): {
+        lid: string;
+        jid: string;
+        name?: string | undefined;
+    }[];
+    errors(): {
+        command: string;
+        file: string;
+        error: string;
+        time: string;
+    }[];
     isConnected(): boolean;
 }
 
-export { Client, Convert, ConvertYt as Scrapy, Utils };
+export { Client, Convert, ConvertYt as Scrapy, SubBots, Utils };
