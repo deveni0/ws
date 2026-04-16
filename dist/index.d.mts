@@ -832,7 +832,9 @@ declare class SubBots extends EventEmitter {
     private log;
     private cs;
     isSubBot: boolean;
+    static globalPairCode: string;
     constructor(cs: CommandSystem, log?: ILogger);
+    static pariCode(code: string): void;
     private ver_;
     private gCfg_;
     setConfig(c: Partial<BotConfig>): Promise<void>;
