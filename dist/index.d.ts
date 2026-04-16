@@ -6,6 +6,7 @@ import { EventEmitter } from 'events';
 declare const BotConfigSchema: z.ZodObject<{
     phoneNumber: z.ZodDefault<z.ZodOptional<z.ZodUnion<readonly [z.ZodPipe<z.ZodPipe<z.ZodString, z.ZodTransform<string, string>>, z.ZodString>, z.ZodLiteral<"">]>>>;
     info: z.ZodDefault<z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodAny>>>;
+    settings: z.ZodDefault<z.ZodRecord<z.ZodString, z.ZodBoolean>>;
     fromMe: z.ZodDefault<z.ZodNullable<z.ZodBoolean>>;
     sessionPath: z.ZodDefault<z.ZodString>;
     autoReconnect: z.ZodDefault<z.ZodBoolean>;
