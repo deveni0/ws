@@ -195,6 +195,7 @@ declare function isStatusJid(jid: string): boolean;
 declare function getJidWithoutDevice(jid: string): string;
 declare function getJidDevice(jid: string): string;
 declare function getPhoneNumberFromJid(jid: string): string;
+declare function duration(url: string): Promise<any>;
 declare function getMessageTimestamp(msg: WAMessage): Date;
 declare function getMessageAgeInSeconds(msg: WAMessage): number;
 declare function isMessageOld(msg: WAMessage, seconds?: number): boolean;
@@ -536,6 +537,7 @@ declare const Utils: {
     countLines: typeof countLines;
     formatFileSize: typeof formatFileSize;
     formatDuration: typeof formatDuration;
+    duration: typeof duration;
     formatNumber: typeof formatNumber;
     formatPercentage: typeof formatPercentage;
     isValidUrl: typeof isValidUrl;
