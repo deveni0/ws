@@ -884,6 +884,7 @@ declare class Client {
     commandSystem: CommandSystem;
     supBot: any | null;
     isSubBot: boolean;
+    unicode: string;
     private handlers;
     private userAccessHandler;
     private userGroupEventHandler;
